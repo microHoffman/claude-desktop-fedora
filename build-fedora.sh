@@ -60,6 +60,53 @@ if [ "$IS_SUDO" = true ] && [ "$ORIGINAL_USER" != "root" ] && [ -d "$ORIGINAL_HO
     fi
 fi
 
+# Check for Mise (mise-en-place)
+USING_MISE=false
+if [ "$IS_SUDO" = true ] && [ "$ORIGINAL_USER" != "root" ]; then
+    MISE_BIN="$ORIGINAL_HOME/.local/bin/mise"
+    MISE_SHIMS="$ORIGINAL_HOME/.local/share/mise/shims"
+    
+    # Try finding mise in common info locations if not in .local/bin
+    if [ ! -x "$MISE_BIN" ]; then
+        if [ -x "/usr/bin/mise" ]; then
+            MISE_BIN="/usr/bin/mise"
+        elif [ -x "/usr/local/bin/mise" ]; then
+             MISE_BIN="/usr/local/bin/mise"
+        fi
+    fi
+
+    if [ -x "$MISE_BIN" ]; then
+        echo "Found Mise at $MISE_BIN for user $ORIGINAL_USER..."
+        
+        # Add shims to PATH first as it's the most reliable way to get the tools
+        if [ -d "$MISE_SHIMS" ]; then
+             echo "Adding Mise shims to PATH: $MISE_SHIMS"
+             export PATH="$MISE_SHIMS:$PATH"
+        fi
+
+        # Make sure the mise binary itself is in PATH (required for shims/hooks)
+        MISE_BIN_DIR=$(dirname "$MISE_BIN")
+        if [[ ":$PATH:" != *":$MISE_BIN_DIR:"* ]]; then
+            echo "Adding Mise binary directory to PATH: $MISE_BIN_DIR"
+            export PATH="$MISE_BIN_DIR:$PATH"
+        fi
+        
+        # Also try to evaluate environment in case variables are needed
+        # We run this as the original user to get their config
+        if su - "$ORIGINAL_USER" -c "$MISE_BIN env shell bash" > /tmp/mise_env.sh 2>/dev/null; then
+            echo "Loading Mise environment..."
+            source /tmp/mise_env.sh
+            rm -f /tmp/mise_env.sh
+        fi
+
+        USING_MISE=true
+    elif [ -d "$MISE_SHIMS" ]; then
+        echo "Found Mise shims directory, adding to PATH..."
+        export PATH="$MISE_SHIMS:$PATH"
+        USING_MISE=true
+    fi
+fi
+
 # Print system information
 echo "System Information:"
 echo "Distribution: $(cat /etc/os-release | grep "PRETTY_NAME" | cut -d'"' -f2)"
@@ -124,13 +171,39 @@ fi
 # Install electron globally via npm if not present
 if ! check_command "electron"; then
     echo "Installing electron via npm..."
-    npm install -g electron
-    if ! check_command "electron"; then
-        echo "Failed to install electron. Please install it manually:"
-        echo "sudo npm install -g electron"
-        exit 1
+    
+    # Temporary workaround for Mise:
+    # npm scripts (or mise wrappers) might reset PATH, causing 'mise' command to be lost.
+    # We symlink it to /usr/local/bin temporarily if we are using mise and it's not already in system path.
+    TEMP_MISE_SYMLINK=false
+    if [ "$USING_MISE" = true ] && ! command -v mise >/dev/null 2>&1; then
+        # Check standard paths just in case command -v failed due to path issues
+        if [ ! -x "/usr/bin/mise" ] && [ ! -x "/usr/local/bin/mise" ]; then
+            echo "Creating temporary symlink for mise in /usr/local/bin to satisfy npm wrappers..."
+            ln -s "$MISE_BIN" /usr/local/bin/mise
+            TEMP_MISE_SYMLINK=true
+        fi
     fi
-    echo "Electron installed successfully"
+    
+    # Run install, allowing failure if it's just the post-install reshim that fails (detected by exit code)
+    if npm install -g electron; then
+        echo "Electron installed successfully"
+    else
+        # If npm failed, check if electron works anyway (often reshim fails but package is there)
+        if check_command "electron"; then
+             echo "Warning: npm returned error code, but electron command works. Ignoring build failure (likely mise reshim issue)."
+        else
+             echo "Failed to install electron. Please install it manually:"
+             echo "sudo npm install -g electron"
+             if [ "$TEMP_MISE_SYMLINK" = true ]; then rm -f /usr/local/bin/mise; fi
+             exit 1
+        fi
+    fi
+
+    if [ "$TEMP_MISE_SYMLINK" = true ]; then
+        rm -f /usr/local/bin/mise
+        echo "Removed temporary mise symlink."
+    fi
 fi
 
 PACKAGE_NAME="claude-desktop"
@@ -369,6 +442,12 @@ EOF
 chmod +x "$INSTALL_DIR/bin/claude-desktop"
 
 # Create RPM spec file
+RPM_REQUIRES="nodejs >= 12.0.0, npm, p7zip"
+if [ "$USING_MISE" = true ]; then
+    echo "Using Mise-managed Node.js, removing explicit RPM dependency on system nodejs/npm."
+    RPM_REQUIRES="p7zip"
+fi
+
 cat > "$WORK_DIR/claude-desktop.spec" << EOF
 Name:           claude-desktop
 Version:        ${VERSION}
@@ -377,7 +456,7 @@ Summary:        Claude Desktop for Linux
 License:        Proprietary
 URL:            https://www.anthropic.com
 BuildArch:      ${ARCHITECTURE}
-Requires:       nodejs >= 12.0.0, npm, p7zip
+Requires:       ${RPM_REQUIRES}
 
 %description
 Claude is an AI assistant from Anthropic.
